@@ -76,8 +76,10 @@ if "fare" in fdf.columns:
 if not include_missing_deck and "deck" in fdf.columns:
     fdf = fdf[~fdf["deck"].isna()]
 
+st.sidebar.markdown(f"### {len(fdf)} passengers selected")
+
 # ---------------- Tabs ----------------
-tab_overview, tab_insights, tab_charts = st.tabs(["Overview", "Survival Insights", "Charts"])
+tab_overview, tab_insights, tab_charts, tab_answers = st.tabs(["Overview", "Survival Insights", "Charts", "Answers"])
 
 # ---------------- Overview ----------------
 with tab_overview:
@@ -214,6 +216,144 @@ with tab_charts:
         ax5.set_ylabel(series.capitalize())
         ax5.set_title(f"{series.capitalize()} (sorted {order_by})")
         st.pyplot(fig5, use_container_width=True)
+
+# ---------------- Answers (guided findings) ----------------
+with tab_answers:
+    st.subheader("Guided answers (based on current filters)")
+    st.caption(
+        "These summaries update with your sidebar filters, so answers reflect the current subset."
+    )
+
+    if fdf.empty or "survived" not in fdf.columns:
+        st.info("No data to analyse (check filters) or no `survived` column.")
+    else:
+        # Helper for safe survival% format
+        def _pct(x): 
+            return float(x) * 100.0
+
+        # Q1. Highest survival rate by Sex × Class × Embark town
+        with st.expander("Q1) Who had the highest survival rate (Sex × Class × Embark town)?", expanded=True):
+            cats = ["sex", "class", "embark_town"]
+            have = [c for c in cats if c in fdf.columns]
+            if len(have) >= 2:  # need at least sex & class, embark may be missing in some rows
+                g = (
+                    fdf.groupby(have, dropna=False)["survived"]
+                    .mean()
+                    .mul(100)
+                    .reset_index()
+                    .rename(columns={"survived": "survival_rate_%"})
+                    .sort_values("survival_rate_%", ascending=False)
+                )
+                st.dataframe(g, use_container_width=True)
+                if not g.empty:
+                    top = g.iloc[0].to_dict()
+                    st.markdown(
+                        f"**Top group:** {', '.join(f'{k}={top[k]}' for k in have)} - "
+                        f"**{top['survival_rate_%']:.1f}%**"
+                    )
+            else:
+                st.write("Need at least `sex` and `class` present.")
+
+        # Q2. Relationship between Fare and Survival
+        with st.expander("Q2) Fare vs Survival... do higher fares always mean better odds?"):
+            means = (
+                fdf.groupby("survived")[["fare"]]
+                .mean(numeric_only=True)
+                .rename(columns={"fare": "mean_fare"})
+                .round(2)
+            )
+            st.dataframe(means, use_container_width=True)
+            # Correlation (Spearman handles ranks; survived is 0/1)
+            try:
+                corr = fdf[["fare", "survived"]].dropna().corr(method="spearman").loc["fare", "survived"]
+                st.markdown(f"**Spearman correlation (fare vs survived): {corr:.3f}**")
+                st.caption("Positive means higher fare tends to align with higher survival, within the current filters.")
+            except Exception:
+                st.caption("Correlation not available (insufficient data).")
+
+            # Quick quantile look
+            q = (
+                fdf[["fare", "survived"]]
+                .dropna()
+                .assign(fare_bin=pd.qcut(fdf["fare"].dropna(), q=4, duplicates="drop"))
+                .groupby("fare_bin")["survived"].mean().mul(100).reset_index()
+                .rename(columns={"survived": "survival_rate_%"})
+            )
+            if not q.empty:
+                st.markdown("**Survival by fare quartile**")
+                st.dataframe(q, use_container_width=True)
+
+        # Q3. Age and Survival (children vs adults vs seniors)
+        with st.expander("Q3) How does age affect survival (children, adults, seniors)?"):
+            if "age" in fdf.columns:
+                bins   = [0, 12, 18, 40, 60, 200]
+                labels = ["Child (0–12)", "Teen (13–18)", "Adult (19–40)", "Midlife (41–60)", "Senior (60+)"]
+                ageb = pd.cut(fdf["age"], bins=bins, labels=labels, right=True)
+                tbl = (
+                    fdf.assign(age_group=ageb)
+                    .groupby("age_group", dropna=False)["survived"]
+                    .mean()
+                    .mul(100)
+                    .reset_index()
+                    .rename(columns={"survived": "survival_rate_%"})
+                )
+                st.dataframe(tbl, use_container_width=True)
+                if not tbl.empty:
+                    best = tbl.sort_values("survival_rate_%", ascending=False).iloc[0]
+                    st.markdown(f"**Highest survival:** {best['age_group']} | **{best['survival_rate_%']:.1f}%**")
+            else:
+                st.write("No `age` column in the current dataset.")
+
+        # Q4. Combine Sex & Class
+        with st.expander("Q4) What changes when you filter by both Sex and Class?"):
+            if all(c in fdf.columns for c in ["sex", "class"]):
+                pivot = (
+                    pd.crosstab(fdf["sex"], fdf["class"], values=fdf["survived"], aggfunc="mean")
+                    .mul(100)
+                    .round(1)
+                )
+                st.markdown("**Survival rate (%) by Sex × Class**")
+                st.dataframe(pivot, use_container_width=True)
+            else:
+                st.write("Need `sex` and `class`.")
+
+        # Q5. Bonus - surface interesting groups automatically
+        with st.expander("Q5) Bonus: non-obvious highs & lows across categories"):
+            cand_cols = [
+                c for c in fdf.select_dtypes(include=["category", "object"]).columns
+                if c not in {"alive"}  # skip duplicate status
+            ]
+            results = []
+            overall = _pct(fdf["survived"].mean())
+            for c in cand_cols:
+                tmp = (
+                    fdf.groupby(c, dropna=False)["survived"]
+                    .agg(rate=lambda s: _pct(s.mean()), n="count")
+                    .reset_index()
+                    .rename(columns={"rate": "survival_rate_%", "n": "count"})
+                )
+                tmp["column"] = c
+                results.append(tmp)
+            if results:
+                allg = pd.concat(results, ignore_index=True)
+                # keep groups with at least 8 rows to avoid noise
+                allg = allg[allg["count"] >= 8]
+                high = allg.sort_values("survival_rate_%", ascending=False).head(5)
+                low  = allg.sort_values("survival_rate_%", ascending=True).head(5)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Top 5 highest survival groups**")
+                    st.dataframe(high, use_container_width=True)
+                    st.markdown("See those top four groups? They look impressive at first glance - 75% survival! But look at what the column says: deck=None, who=None. That’s not a pattern in the real world, it’s just where data was missing. It’s a good reminder that data gaps can create fake correlations.")
+                with c2:
+                    st.markdown("**Top 5 lowest survival groups**")
+                    st.dataframe(low, use_container_width=True)
+                    st.markdown("At first glance, it looks like people with missing deck or class info had low survival — but that’s not the cause. It’s a proxy for something else: they were probably 3rd class passengers, and those passengers were hit hardest. The only genuinely meaningful variable here is sex=male, with a survival rate of just 19%. That tells a clear story that matches history — men were much less likely to survive than women. The rest mostly remind us that missing data often clusters in the least fortunate groups.")
+
+                st.caption(f"Overall survival (current filters): **{overall:.1f}%**  •  Minimum group size = 8")
+            else:
+                st.write("No categorical columns available to scan.")
 
 # ---------------- Notes ----------------
 st.divider()
